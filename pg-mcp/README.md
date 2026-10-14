@@ -293,6 +293,8 @@ Return Type: sql
 | `DATABASE_HOST`            | PostgreSQL 主机 | `localhost` |
 | `DATABASE_PORT`            | PostgreSQL 端口 | `5432`      |
 | `DATABASE_NAME`            | 数据库名称      | 必需        |
+| `DATABASE_DATABASES`       | 附加数据库名列表（逗号分隔） | 空     |
+| `DATABASE_ALL_DATABASES`   | 自动发现并服务实例上所有非模板数据库 | `false` |
 | `DATABASE_USER`            | 数据库用户      | 必需        |
 | `DATABASE_PASSWORD`        | 数据库密码      | 必需        |
 | `DATABASE_MIN_POOL_SIZE`   | 池中最小连接数  | `5`         |
@@ -335,6 +337,8 @@ Return Type: sql
 | `RESILIENCE_BACKOFF_FACTOR`            | 指数退避倍数     | `2.0`  |
 | `RESILIENCE_CIRCUIT_BREAKER_THRESHOLD` | 熔断前的失败数   | `5`    |
 | `RESILIENCE_CIRCUIT_BREAKER_TIMEOUT`   | 熔断器超时（秒）   | `60`   |
+| `RATE_LIMIT_MAX_CONCURRENT_QUERIES`    | 最大并发数据库查询数 | `10`   |
+| `RATE_LIMIT_MAX_CONCURRENT_LLM`        | 最大并发 LLM 调用数 | `5`    |
 
 ### 可观测性设置
 

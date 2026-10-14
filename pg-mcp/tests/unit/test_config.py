@@ -14,6 +14,7 @@ from pg_mcp.config.settings import (
     DatabaseConfig,
     ObservabilityConfig,
     OpenAIConfig,
+    RateLimitConfig,
     ResilienceConfig,
     SecurityConfig,
     Settings,
@@ -27,8 +28,8 @@ class TestDatabaseConfig:
     """Tests for DatabaseConfig."""
 
     def test_default_values(self) -> None:
-        """Test default configuration values."""
-        config = DatabaseConfig()
+        """Test default configuration values (with .env isolated)."""
+        config = DatabaseConfig(_env_file=None)
         assert config.host == "localhost"
         assert config.port == 5432
         assert config.name == "postgres"
@@ -99,7 +100,7 @@ class TestOpenAIConfig:
 
     def test_default_values(self) -> None:
         """Test default configuration values."""
-        config = OpenAIConfig(api_key="sk-test123")
+        config = OpenAIConfig(api_key="sk-test123", _env_file=None)
         assert config.model == "gpt-4o-mini"
         assert config.max_tokens == 2000
         assert config.temperature == 0.0
@@ -286,13 +287,13 @@ class TestObservabilityConfig:
     """Tests for ObservabilityConfig."""
 
     def test_default_values(self) -> None:
-        """Test default configuration values."""
-        config = ObservabilityConfig()
+        """Test default configuration values (with .env isolated)."""
+        config = ObservabilityConfig(_env_file=None)
         # metrics_enabled 在测试环境可能被禁用以避免启动 HTTP 服务器
         # 生产环境应该通过环境变量显式设置
         assert config.metrics_port == 9090
         assert config.log_level == "INFO"
-        assert config.log_format == "json"
+        assert config.log_format == "text"
 
     def test_custom_values(self) -> None:
         """Test custom configuration values."""
@@ -420,3 +421,77 @@ class TestSettingsGlobalInstance:
         assert settings.openai.model == "gpt-4"
         assert settings.database.host == "env.host.com"
         assert settings.security.max_rows == 5000
+
+
+class TestMultiDatabaseConfig:
+    """Tests for multi-database configuration (DATABASE_DATABASES / DATABASE_ALL_DATABASES)."""
+
+    def test_default_is_single_database(self) -> None:
+        """By default only the primary database is served."""
+        config = DatabaseConfig(_env_file=None)
+        assert config.all_databases is False
+        assert config.databases == []
+        assert config.database_names == [config.name]
+
+    def test_databases_from_comma_string(self) -> None:
+        """Comma-separated DATABASE_DATABASES parses into a list."""
+        config = DatabaseConfig(databases="db_a, db_b,db_c", _env_file=None)
+        assert config.databases == ["db_a", "db_b", "db_c"]
+
+    def test_database_names_deduplicates_primary(self) -> None:
+        """Primary name stays first; duplicates are removed."""
+        config = DatabaseConfig(name="main", databases=["main", "db2"], _env_file=None)
+        assert config.database_names == ["main", "db2"]
+
+    def test_all_databases_flag(self) -> None:
+        """DATABASE_ALL_DATABASES enables instance-wide discovery."""
+        config = DatabaseConfig(all_databases=True, _env_file=None)
+        assert config.all_databases is True
+
+
+class TestSecurityAccessControlConfig:
+    """Tests for SECURITY_BLOCKED_TABLES / COLUMNS / ALLOWED_SCHEMAS / EXPLAIN switches."""
+
+    def test_new_fields_default_empty_and_safe(self) -> None:
+        config = SecurityConfig(_env_file=None)
+        assert config.blocked_tables == []
+        assert config.blocked_columns == []
+        assert config.allowed_schemas == []
+        assert config.allow_explain is False
+        assert config.allow_explain_analyze is False
+
+    def test_blocked_tables_and_columns_from_string(self) -> None:
+        config = SecurityConfig(
+            blocked_tables="secrets, audit_log",
+            blocked_columns="password,credit_card",
+            _env_file=None,
+        )
+        assert config.blocked_tables == ["secrets", "audit_log"]
+        assert config.blocked_columns == ["password", "credit_card"]
+
+    def test_allowed_schemas_from_string(self) -> None:
+        config = SecurityConfig(allowed_schemas="public, sales", _env_file=None)
+        assert config.allowed_schemas == ["public", "sales"]
+
+
+class TestRateLimitConfig:
+    """Tests for RATE_LIMIT_* configuration."""
+
+    def test_defaults(self) -> None:
+        config = RateLimitConfig(_env_file=None)
+        assert config.max_concurrent_queries == 10
+        assert config.max_concurrent_llm == 5
+
+    def test_custom_values(self) -> None:
+        config = RateLimitConfig(max_concurrent_queries=50, max_concurrent_llm=20, _env_file=None)
+        assert config.max_concurrent_queries == 50
+        assert config.max_concurrent_llm == 20
+
+    def test_rejects_zero(self) -> None:
+        with pytest.raises(ValidationError):
+            RateLimitConfig(max_concurrent_queries=0, _env_file=None)
+
+    def test_settings_aggregates_rate_limit(self) -> None:
+        settings = Settings(_env_file=None)
+        assert isinstance(settings.rate_limit, RateLimitConfig)
+        assert settings.rate_limit.max_concurrent_queries >= 1

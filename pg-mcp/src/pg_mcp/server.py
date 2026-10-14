@@ -14,7 +14,7 @@ from mcp.server.fastmcp import FastMCP
 
 from pg_mcp.cache.schema_cache import SchemaCache
 from pg_mcp.config.settings import Settings
-from pg_mcp.db.pool import close_pools, create_pool
+from pg_mcp.db.pool import close_pools, create_pool, create_pools
 from pg_mcp.models.query import QueryRequest, QueryResponse, ReturnType
 from pg_mcp.observability.logging import configure_logging, get_logger
 from pg_mcp.observability.metrics import MetricsCollector
@@ -96,16 +96,30 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
 
         # 3. Create database connection pools
         logger.info("Creating database connection pools...")
-        _pools = {}
-        # Note: For single database configuration, we use the main database config
-        pool = await create_pool(_settings.database)
-        _pools[_settings.database.name] = pool
+        db_config = _settings.database
+        if db_config.all_databases:
+            # Discover every connectable non-template database on the instance
+            logger.info("Discovering all databases on the instance...")
+            discovery_pool = await create_pool(db_config.model_copy(update={"name": "postgres"}))
+            try:
+                async with discovery_pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        "SELECT datname FROM pg_database WHERE datistemplate = false AND datallowconn"
+                    )
+            finally:
+                await discovery_pool.close()
+            db_names = sorted(row["datname"] for row in rows)
+            logger.info(f"Discovered {len(db_names)} databases: {db_names}")
+        else:
+            db_names = db_config.database_names
+
+        configs = [db_config.model_copy(update={"name": name}) for name in db_names]
+        _pools = await create_pools(configs) if len(configs) > 1 else {
+            db_names[0]: await create_pool(configs[0]),
+        }
         logger.info(
-            f"Created connection pool for database '{_settings.database.name}'",
-            extra={
-                "min_size": _settings.database.min_pool_size,
-                "max_size": _settings.database.max_pool_size,
-            },
+            f"Created {len(_pools)} connection pool(s)",
+            extra={"databases": sorted(_pools.keys())},
         )
 
         # 4. Load Schema cache
@@ -149,12 +163,11 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         # SQL Generator
         sql_generator = SQLGenerator(_settings.openai)
 
-        # SQL Validator
+        # SQL Validator — all controls come from SecurityConfig (SECURITY_* env vars)
         sql_validator = SQLValidator(
             config=_settings.security,
-            blocked_tables=None,  # Can be configured via settings if needed
-            blocked_columns=None,  # Can be configured via settings if needed
-            allow_explain=False,
+            allow_explain=_settings.security.allow_explain,
+            allow_explain_analyze=_settings.security.allow_explain_analyze,
         )
 
         # SQL Executor (create one per database)
@@ -183,10 +196,10 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
             recovery_timeout=_settings.resilience.circuit_breaker_timeout,
         )
 
-        # Rate Limiter
+        # Rate Limiter — configurable via RATE_LIMIT_* env vars
         _rate_limiter = MultiRateLimiter(
-            query_limit=10,  # Can be made configurable
-            llm_limit=5,  # Can be made configurable
+            query_limit=_settings.rate_limit.max_concurrent_queries,
+            llm_limit=_settings.rate_limit.max_concurrent_llm,
         )
 
         # 8. Create QueryOrchestrator
@@ -194,7 +207,8 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         _orchestrator = QueryOrchestrator(
             sql_generator=sql_generator,
             sql_validator=sql_validator,
-            sql_executor=sql_executors[_settings.database.name],  # Use primary executor
+            sql_executor=sql_executors[db_names[0]],  # Primary/fallback executor
+            sql_executors=sql_executors,  # Per-database executors
             result_validator=result_validator,
             schema_cache=_schema_cache,
             pools=_pools,

@@ -456,3 +456,57 @@ class TestParserEdgeCases:
         self, validator: SQLValidator, case_id: str, sql: str
     ) -> None:
         assert_allowed(validator, sql)
+
+
+# ============================================================================
+# Config-driven switches: allowed_schemas / allow_explain_analyze (SEC-CFG-*)
+# ============================================================================
+
+
+class TestAllowedSchemas:
+    """Schema allow-list wiring (SECURITY_ALLOWED_SCHEMAS)."""
+
+    @pytest.fixture
+    def schema_validator(self) -> SQLValidator:
+        return SQLValidator(SecurityConfig(), allowed_schemas=["public"])
+
+    def test_qualified_foreign_schema_blocked(self, schema_validator: SQLValidator) -> None:
+        """SEC-CFG-001: pg_catalog access is denied when only public is allowed."""
+        assert_blocked(schema_validator, "SELECT * FROM pg_catalog.pg_tables")
+        assert_blocked(schema_validator, "SELECT * FROM information_schema.tables")
+
+    def test_allowed_schema_passes(self, schema_validator: SQLValidator) -> None:
+        """SEC-CFG-002: tables inside an allowed schema pass."""
+        assert_allowed(schema_validator, "SELECT * FROM public.users")
+        assert_allowed(schema_validator, "SELECT * FROM users")  # unqualified: search_path-locked
+
+    def test_empty_list_allows_all(self, validator: SQLValidator) -> None:
+        """SEC-CFG-003: no allow-list configured means no schema restriction."""
+        assert_allowed(validator, "SELECT * FROM pg_catalog.pg_tables")
+
+    def test_config_defaults_wired(self) -> None:
+        """SEC-CFG-004: validator falls back to SecurityConfig fields."""
+        config = SecurityConfig(allowed_schemas=["sales"], blocked_tables=["t1"], blocked_columns=["c1"])
+        validator = SQLValidator(config)
+        assert validator.allowed_schemas == {"sales"}
+        assert validator.blocked_tables == {"t1"}
+        assert validator.blocked_columns == {"c1"}
+
+
+class TestAllowExplainAnalyzeSwitch:
+    """allow_explain_analyze gating (SECURITY_ALLOW_EXPLAIN_ANALYZE)."""
+
+    def test_blocked_by_default(self, explain_validator: SQLValidator) -> None:
+        """SEC-CFG-011: DEFECT-02 fix holds when only allow_explain is on."""
+        assert_blocked(explain_validator, "EXPLAIN ANALYZE DELETE FROM users")
+
+    def test_allowed_when_explicitly_enabled(self) -> None:
+        """SEC-CFG-012: operators can re-enable EXPLAIN ANALYZE knowingly."""
+        validator = SQLValidator(SecurityConfig(), allow_explain=True, allow_explain_analyze=True)
+        assert_allowed(validator, "EXPLAIN ANALYZE SELECT * FROM users")
+
+    def test_analyze_on_without_explain_still_blocked(self) -> None:
+        """SEC-CFG-013: enabling ANALYZE alone must not open plain EXPLAIN."""
+        validator = SQLValidator(SecurityConfig(), allow_explain=False, allow_explain_analyze=True)
+        assert_blocked(validator, "EXPLAIN ANALYZE SELECT 1")
+        assert_blocked(validator, "EXPLAIN SELECT 1")

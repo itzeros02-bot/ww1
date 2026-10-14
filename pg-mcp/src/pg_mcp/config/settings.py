@@ -5,10 +5,37 @@ and type safety. Configuration is loaded from environment variables with
 sensible defaults.
 """
 
-from typing import Literal
+import json
+from typing import Annotated, Literal
 
 from pydantic import Field, SecretStr, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+# List fields disabled from JSON decoding at the settings-source level so that
+# empty values ("VAR=") and comma-separated values from env/.env/Docker parse
+# cleanly. JSON arrays remain supported via parse_string_list below.
+StringListFromEnv = Annotated[list[str], NoDecode]
+
+
+def parse_string_list(v: str | list[str]) -> list[str]:
+    """Parse a string-list setting from env input.
+
+    Accepts JSON arrays (legacy format), comma-separated strings, and empty
+    strings (yielding an empty list).
+    """
+    if isinstance(v, str):
+        text = v.strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    return [str(item).strip() for item in parsed if str(item).strip()]
+            except json.JSONDecodeError:
+                pass  # fall through to comma-separated parsing
+        return [item.strip() for item in text.split(",") if item.strip()]
+    return v
 
 
 class DatabaseConfig(BaseSettings):
@@ -31,6 +58,28 @@ class DatabaseConfig(BaseSettings):
     command_timeout: float = Field(
         default=30.0, ge=1.0, le=300.0, description="Command execution timeout in seconds"
     )
+
+    # Multi-database settings
+    all_databases: bool = Field(
+        default=False,
+        description="Connect to every non-template database on the instance (discovered at startup)",
+    )
+    databases: StringListFromEnv = Field(
+        default_factory=list,
+        description="Additional database names to serve alongside 'name' (comma-separated env)",
+    )
+
+    @field_validator("databases", mode="before")
+    @classmethod
+    def parse_databases(cls, v: str | list[str]) -> list[str]:
+        """Parse comma-separated string or list."""
+        return parse_string_list(v)
+
+    @property
+    def database_names(self) -> list[str]:
+        """Resolve the configured database list (primary first, deduplicated)."""
+        names = [self.name, *[db for db in self.databases if db != self.name]]
+        return names
 
     @property
     def dsn(self) -> str:
@@ -78,7 +127,7 @@ class SecurityConfig(BaseSettings):
     allow_write_operations: bool = Field(
         default=False, description="Allow write operations (INSERT, UPDATE, DELETE)"
     )
-    blocked_functions: list[str] = Field(
+    blocked_functions: StringListFromEnv = Field(
         default_factory=lambda: [
             "pg_sleep",
             "pg_read_file",
@@ -87,6 +136,25 @@ class SecurityConfig(BaseSettings):
             "lo_export",
         ],
         description="List of blocked PostgreSQL functions",
+    )
+    blocked_tables: StringListFromEnv = Field(
+        default_factory=list,
+        description="Tables that queries may not reference (comma-separated env)",
+    )
+    blocked_columns: StringListFromEnv = Field(
+        default_factory=list,
+        description="Columns that queries may not reference (comma-separated env)",
+    )
+    allowed_schemas: StringListFromEnv = Field(
+        default_factory=list,
+        description="Restrict table access to these schemas; empty list allows all schemas",
+    )
+    allow_explain: bool = Field(
+        default=False, description="Allow plain EXPLAIN statements (plan only, no execution)"
+    )
+    allow_explain_analyze: bool = Field(
+        default=False,
+        description="Allow EXPLAIN ANALYZE. WARNING: it executes the inner statement - only enable for trusted environments",
     )
     max_rows: int = Field(default=10000, ge=1, le=100000, description="Maximum rows to return")
     max_execution_time: float = Field(
@@ -99,13 +167,13 @@ class SecurityConfig(BaseSettings):
         default="public", description="Safe search_path to set during query execution"
     )
 
-    @field_validator("blocked_functions", mode="before")
+    @field_validator(
+        "blocked_functions", "blocked_tables", "blocked_columns", "allowed_schemas", mode="before"
+    )
     @classmethod
-    def parse_blocked_functions(cls, v: str | list[str]) -> list[str]:
-        """Parse comma-separated string or list."""
-        if isinstance(v, str):
-            return [f.strip() for f in v.split(",") if f.strip()]
-        return v
+    def parse_security_string_list(cls, v: str | list[str]) -> list[str]:
+        """Parse JSON array, comma-separated string, or empty string."""
+        return parse_string_list(v)
 
 
 class ValidationConfig(BaseSettings):
@@ -165,6 +233,19 @@ class ResilienceConfig(BaseSettings):
     )
 
 
+class RateLimitConfig(BaseSettings):
+    """Concurrency rate-limiting configuration."""
+
+    model_config = SettingsConfigDict(env_prefix="RATE_LIMIT_", env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    max_concurrent_queries: int = Field(
+        default=10, ge=1, le=1000, description="Maximum concurrent database queries"
+    )
+    max_concurrent_llm: int = Field(
+        default=5, ge=1, le=1000, description="Maximum concurrent LLM API calls"
+    )
+
+
 class ObservabilityConfig(BaseSettings):
     """Observability and monitoring configuration."""
 
@@ -201,6 +282,7 @@ class Settings(BaseSettings):
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
     resilience: ResilienceConfig = Field(default_factory=ResilienceConfig)
+    rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
 
     @property

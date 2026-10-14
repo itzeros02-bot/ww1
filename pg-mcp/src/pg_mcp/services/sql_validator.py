@@ -79,20 +79,39 @@ class SQLValidator:
         config: SecurityConfig,
         blocked_tables: list[str] | None = None,
         blocked_columns: list[str] | None = None,
+        allowed_schemas: list[str] | None = None,
         allow_explain: bool = False,
+        allow_explain_analyze: bool = False,
     ) -> None:
         """Initialize SQL validator.
 
         Args:
             config: Security configuration containing blocked functions and settings.
             blocked_tables: Optional list of table names to block access to.
+                Defaults to config.blocked_tables when not provided.
             blocked_columns: Optional list of column names to block access to.
+                Defaults to config.blocked_columns when not provided.
+            allowed_schemas: Optional allow-list of schemas for table access.
+                Empty/None means all schemas are permitted. Defaults to
+                config.allowed_schemas when not provided.
             allow_explain: Whether to allow EXPLAIN statements.
+            allow_explain_analyze: Whether to allow EXPLAIN ANALYZE. WARNING:
+                EXPLAIN ANALYZE executes the inner statement, so this should
+                only be enabled in trusted environments.
         """
         self.config = config
-        self.blocked_tables = {t.lower() for t in (blocked_tables or [])}
-        self.blocked_columns = {c.lower() for c in (blocked_columns or [])}
+        self.blocked_tables = {
+            t.lower() for t in (blocked_tables if blocked_tables is not None else config.blocked_tables)
+        }
+        self.blocked_columns = {
+            c.lower()
+            for c in (blocked_columns if blocked_columns is not None else config.blocked_columns)
+        }
+        self.allowed_schemas = {
+            s.lower() for s in (allowed_schemas if allowed_schemas is not None else config.allowed_schemas)
+        }
         self.allow_explain = allow_explain
+        self.allow_explain_analyze = allow_explain_analyze
 
         # Combine built-in dangerous functions with custom blocked functions
         self.blocked_functions = self.BUILTIN_DANGEROUS_FUNCTIONS | {
@@ -168,7 +187,7 @@ class SQLValidator:
                 # Note: fail-closed — a string literal containing the word ANALYZE
                 # is also rejected (safe over-rejection).
                 explain_tail = str(statement.expression or "").upper()
-                if "ANALYZE" in explain_tail:
+                if "ANALYZE" in explain_tail and not self.allow_explain_analyze:
                     raise SecurityViolationError(
                         "EXPLAIN ANALYZE is not allowed because it executes the "
                         "inner statement. Use plain EXPLAIN instead."
@@ -207,6 +226,9 @@ class SQLValidator:
             raise SecurityViolationError(error)
 
         if error := self._check_blocked_tables(statement):
+            raise SecurityViolationError(error)
+
+        if error := self._check_allowed_schemas(statement):
             raise SecurityViolationError(error)
 
         if error := self._check_blocked_columns(statement):
@@ -303,6 +325,29 @@ class SQLValidator:
 
             if table_name in self.blocked_tables:
                 return f"Access to table '{table_name}' is not allowed"
+
+        return None
+
+    def _check_allowed_schemas(self, statement: exp.Expression) -> str | None:
+        """Check that qualified table references stay within allowed schemas.
+
+        Unqualified table names resolve through search_path (locked to
+        safe_search_path at execution time) and are always permitted here.
+        When allowed_schemas is empty, all schemas are permitted.
+
+        Args:
+            statement: Parsed SQL statement.
+
+        Returns:
+            Error message if check fails, None otherwise.
+        """
+        if not self.allowed_schemas:
+            return None
+
+        for table in statement.find_all(exp.Table):
+            schema = (table.db or "").lower()
+            if schema and schema not in self.allowed_schemas:
+                return f"Access to schema '{schema}' is not allowed"
 
         return None
 
