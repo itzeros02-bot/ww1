@@ -96,6 +96,18 @@ PREPARE、EXECUTE、CALL、DO 匿名块、VACUUM、SET、BEGIN/COMMIT、FETCH/CL
 | SEC-EDGE-010 | 1 MB 超长查询 | 给出判定不崩溃 | ✅ 通过 |
 | SEC-EDGE-101~104 | Unicode 转义串/dollar-quote/中文 | 放行 | ✅ 放行 |
 
+### SEC-CFG 配置驱动开关（第 2 轮新增：settings ↔ validator 接线验证）
+
+| 用例 ID | 输入 | 预期 | 结果 |
+|---------|------|------|------|
+| SEC-CFG-001 | `allowed_schemas=["public"]` 时访问 `pg_catalog` / `information_schema` | 拒绝 | ✅ 拒绝 |
+| SEC-CFG-002 | 白名单内 schema / 未限定表名 | 放行 | ✅ 放行 |
+| SEC-CFG-003 | `allowed_schemas` 为空（未配置） | 不做 schema 限制 | ✅ 放行 |
+| SEC-CFG-004 | SecurityConfig 的 blocked_tables/columns/allowed_schemas 默认注入 validator | 三项均生效 | ✅ 一致 |
+| SEC-CFG-011 | 仅开 `allow_explain` 时执行 `EXPLAIN ANALYZE DELETE` | 拒绝（DEFECT-02 修复保持默认拒绝） | ✅ 拒绝 |
+| SEC-CFG-012 | 显式开 `allow_explain_analyze=True` | 放行（运维知情开启） | ✅ 放行 |
+| SEC-CFG-013 | 只开 `allow_explain_analyze` 不开 `allow_explain` | 普通与 ANALYZE EXPLAIN 均拒绝 | ✅ 拒绝 |
+
 ## 3. 用例矩阵（集成，`tests/integration/`，真实 PostgreSQL）
 
 | 用例 ID | 场景 | 验证点 | 结果 |
@@ -115,12 +127,15 @@ PREPARE、EXECUTE、CALL、DO 匿名块、VACUUM、SET、BEGIN/COMMIT、FETCH/CL
 | SEC-INT-014 | 校验拒绝 → 不触达 DB | 短路 | ✅ |
 | SEC-INT-015 | schema 限定读取 | 与基准计数一致 | ✅ |
 
-## 4. 统计
+## 4. 统计（截至第 2 轮，2026-10-14）
 
 | 指标 | 数量 |
 |------|------|
-| 对抗安全用例（新增） | 126 |
+| 对抗安全用例（新增，含 SEC-CFG 7 例） | 133 |
 | 集成用例（新增） | 15 |
-| 既有回归用例 | 294 |
-| **总计** | **435** |
+| 集成用例（既有 full-flow 回归） | 19 |
+| 既有单元回归用例（含修复的 3 个失真默认值测试） | 259 |
+| 既有 e2e 回归用例 | 27 |
+| **总计** | **453（全部通过）** |
 | 发现缺陷 | 5（4 个已修复，1 个已知局限，见 DEFECT_REPORT.md） |
+| 评审主线补齐 | 多数据库支持 / 安全开关配置化 / 限流配置化（SEC-CFG 覆盖） |
