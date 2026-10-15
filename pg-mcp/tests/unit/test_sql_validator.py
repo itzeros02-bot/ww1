@@ -10,6 +10,8 @@ Tests cover:
 """
 
 import pytest
+import sqlglot
+from sqlglot import exp
 
 from pg_mcp.config.settings import SecurityConfig
 from pg_mcp.models.errors import SecurityViolationError, SQLParseError
@@ -664,3 +666,83 @@ class TestSubqueryWithForbiddenOperations:
         is_valid, error = validator.validate(sql)
         assert is_valid
         assert error is None
+
+
+class TestDefensiveBranches:
+    """Direct tests for defensive exception branches (security-module ≥95% gate).
+
+    These paths are unreachable or hard to reach through public inputs
+    (they guard against parser surprises), so they are exercised by
+    injecting AST nodes / stubbing the parser.
+    """
+
+    @pytest.fixture
+    def validator(self) -> SQLValidator:
+        return SQLValidator(SecurityConfig())
+
+    def test_empty_parse_result_rejected(self, validator: SQLValidator, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Parser returning an empty statement list must fail closed (line 168)."""
+        monkeypatch.setattr(sqlglot, "parse", lambda sql, read="postgres": [])
+        with pytest.raises(SQLParseError, match="No valid SQL statement found"):
+            validator.validate_or_raise("SELECT 1")
+
+    def test_with_without_main_query_rejected(self, validator: SQLValidator, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A WITH node lacking its main query must fail closed (line 238)."""
+        empty_with = exp.With()
+        monkeypatch.setattr(sqlglot, "parse", lambda sql, read="postgres": [empty_with])
+        with pytest.raises(SQLParseError, match="WITH statement has no main query"):
+            validator.validate_or_raise("SELECT 1")
+
+    def test_toplevel_with_main_query_validated(self, validator: SQLValidator, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A top-level WITH node with a main query validates the inner query (line 215).
+
+        sqlglot 28.x parses CTE queries as Select-with-CTE, so a bare top-level
+        With node only occurs via AST injection (defensive path).
+        """
+        with_node = exp.With(this=sqlglot.parse_one("SELECT 1", read="postgres"))
+        monkeypatch.setattr(sqlglot, "parse", lambda sql, read="postgres": [with_node])
+        is_valid, error = validator.validate("SELECT 1")
+        assert is_valid
+        assert error is None
+
+    def test_subquery_with_non_select_rejected(self, validator: SQLValidator, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Subquery whose body is neither SELECT nor WITH is rejected (lines 252-253, 404)."""
+        values_node = exp.Values(
+            expressions=[exp.Tuple(expressions=[exp.Literal.number(1)])]
+        )
+        subquery = exp.Subquery(this=values_node)
+        select = sqlglot.parse_one("SELECT * FROM t", read="postgres")
+        select.set("from", exp.From(this=subquery))
+        monkeypatch.setattr(sqlglot, "parse", lambda sql, read="postgres": [select])
+
+        with pytest.raises(SecurityViolationError, match="Subqueries must contain only SELECT"):
+            validator.validate_or_raise("SELECT * FROM t")
+
+    def test_check_statement_type_forbidden_direct(self, validator: SQLValidator) -> None:
+        """Top-level forbidden type check returns a precise message (lines 214-217)."""
+        delete_node = sqlglot.parse_one("DELETE FROM users", read="postgres")
+        message = validator._check_statement_type(delete_node)
+        assert message is not None
+        assert "DELETE" in message
+
+    def test_check_subquery_safety_forbidden_direct(self, validator: SQLValidator) -> None:
+        """Forbidden statement nested in a subquery is reported (lines 399-400)."""
+        subquery = exp.Subquery(this=sqlglot.parse_one("DELETE FROM users", read="postgres"))
+        wrapper = sqlglot.parse_one("SELECT * FROM t", read="postgres")
+        wrapper.set("where", exp.Where(this=subquery))
+        message = validator._check_subquery_safety(wrapper)
+        assert message is not None
+        assert "DELETE" in message
+
+    def test_subquery_without_body_is_ignored(self, validator: SQLValidator) -> None:
+        """An empty Subquery node (no body) must not crash the safety walk (branch 393)."""
+        wrapper = sqlglot.parse_one("SELECT * FROM t", read="postgres")
+        wrapper.set("where", exp.Where(this=exp.Subquery()))
+        assert validator._check_subquery_safety(wrapper) is None
+
+    def test_extract_tables_skips_nameless_table(self, validator: SQLValidator, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Table nodes without a name are skipped during extraction (branch 447)."""
+        nameless_select = exp.Select(expressions=[exp.Star()]).from_(exp.Table())
+        monkeypatch.setattr(sqlglot, "parse_one", lambda sql, read="postgres": nameless_select)
+
+        assert validator.extract_tables("SELECT * FROM t") == []
